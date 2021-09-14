@@ -5,6 +5,8 @@
 #include "FogOfWarManager.h"
 #include "RegisterToFOW.h"
 #include "RunnableThread.h"
+#include "RegisterAreaToFOW.h"
+#include "Components/BoxComponent.h"
 
 AFogOfWarWorker::AFogOfWarWorker() {}
 
@@ -81,15 +83,7 @@ void AFogOfWarWorker::UpdateFowTexture() {
 
 		FCollisionQueryParams queryParams(FName(TEXT("FOW trace")), false, (*Itr));
 		int halfKernelSize = (Manager->blurKernelSize - 1) / 2;
-
-		//Store the positions we want to blur
-		for (int y = posY - sightTexels - halfKernelSize; y <= posY + sightTexels + halfKernelSize; y++) {
-			for (int x = posX - sightTexels - halfKernelSize; x <= posX + sightTexels + halfKernelSize; x++) {
-				if (x > 0 && x < size && y > 0 && y < size) {
-					texelsToBlur.Add(FIntPoint(x, y));
-				}
-			}
-		}
+		
 
 		//This is checking if the current actor is able to:
 		//A. Fully unveil the texels, B. unveil FOW, C, Unveil Terra Incognita
@@ -98,39 +92,101 @@ void AFogOfWarWorker::UpdateFowTexture() {
 		//Dont forget the braces >()
 
 		if (*Itr != nullptr) {
-			isWriteUnFog = (*Itr)->FindComponentByClass<URegisterToFOW>()->WriteUnFog;
-			isWriteFow = (*Itr)->FindComponentByClass<URegisterToFOW>()->WriteFow;
-			isWriteTerraIncog = (*Itr)->FindComponentByClass<URegisterToFOW>()->WriteTerraIncog;
-		}
+			if ((*Itr)->FindComponentByClass<URegisterToFOW>() != nullptr)
+			{
+				isWriteUnFog = (*Itr)->FindComponentByClass<URegisterToFOW>()->WriteUnFog;
+				isWriteFow = (*Itr)->FindComponentByClass<URegisterToFOW>()->WriteFow;
+				isWriteTerraIncog = (*Itr)->FindComponentByClass<URegisterToFOW>()->WriteTerraIncog;
 
+				//Store the positions we want to blur
+				for (int y = posY - sightTexels - halfKernelSize; y <= posY + sightTexels + halfKernelSize; y++) {
+					for (int x = posX - sightTexels - halfKernelSize; x <= posX + sightTexels + halfKernelSize; x++) {
+						if (x > 0 && x < size && y > 0 && y < size) {
+							texelsToBlur.Add(FIntPoint(x, y));
+						}
+					}
+				}
 
+				if (isWriteUnFog)
+				{
+					//Unveil the positions our actors are currently looking at
+					for (int y = posY - sightTexels; y <= posY + sightTexels; y++) {
+						for (int x = posX - sightTexels; x <= posX + sightTexels; x++) {
+							//Kernel for radial sight
+							if (x > 0 && x < size && y > 0 && y < size) {
+								FVector2D currentTextureSpacePos = FVector2D(x, y);
+								int length = (int)(textureSpacePos - currentTextureSpacePos).Size();
+								if (length <= sightTexels) {
+									FVector currentWorldSpacePos = FVector(
+										((x - (int)halfTextureSize)) * dividend,
+										((y - (int)halfTextureSize)) * dividend,
+										position.Z);
 
-		if (isWriteUnFog) {
-			//Unveil the positions our actors are currently looking at
-			for (int y = posY - sightTexels; y <= posY + sightTexels; y++) {
-				for (int x = posX - sightTexels; x <= posX + sightTexels; x++) {
-					//Kernel for radial sight
-					if (x > 0 && x < size && y > 0 && y < size) {
-						FVector2D currentTextureSpacePos = FVector2D(x, y);
-						int length = (int)(textureSpacePos - currentTextureSpacePos).Size();
-						if (length <= sightTexels) {
-							FVector currentWorldSpacePos = FVector(
-								((x - (int)halfTextureSize)) * dividend,
-								((y - (int)halfTextureSize)) * dividend,
-								position.Z);
+									//CONSIDER: This is NOT the most efficient way to do conditional unfogging. With long view distances and/or a lot of actors affecting the FOW-data
+									//it would be preferrable to not trace against all the boundary points and internal texels/positions of the circle, but create and cache "rasterizations" of
+									//viewing circles (using Bresenham's midpoint circle algorithm) for the needed sightranges, shift the circles to the actor's location
+									//and just trace against the boundaries.
+									//We would then use Manager->GetWorld()->LineTraceSingle() and find the first collision texel. Having found the nearest collision
+									//for every ray we would unveil all the points between the collision and origo using Bresenham's Line-drawing algorithm.
+									//However, the tracing doesn't seem like it takes much time at all (~0.02ms with four actors tracing circles of 18 texels each),
+									//it's the blurring that chews CPU..
 
-							//CONSIDER: This is NOT the most efficient way to do conditional unfogging. With long view distances and/or a lot of actors affecting the FOW-data
-							//it would be preferrable to not trace against all the boundary points and internal texels/positions of the circle, but create and cache "rasterizations" of
-							//viewing circles (using Bresenham's midpoint circle algorithm) for the needed sightranges, shift the circles to the actor's location
-							//and just trace against the boundaries.
-							//We would then use Manager->GetWorld()->LineTraceSingle() and find the first collision texel. Having found the nearest collision
-							//for every ray we would unveil all the points between the collision and origo using Bresenham's Line-drawing algorithm.
-							//However, the tracing doesn't seem like it takes much time at all (~0.02ms with four actors tracing circles of 18 texels each),
-							//it's the blurring that chews CPU..
+									if (!Manager->GetWorld()->LineTraceTestByChannel(position, currentWorldSpacePos, ECC_WorldStatic, queryParams)) {
 
-							if (!Manager->GetWorld()->LineTraceTestByChannel(position, currentWorldSpacePos, ECC_WorldStatic, queryParams)) {
+										//Is the actor able to affect the terra incognita
 
-								//Is the actor able to affect the terra incognita
+										if (isWriteTerraIncog) {
+											//if the actor is able then
+											//Unveil the positions we are currently seeing
+											Manager->UnfoggedData[x + y * Manager->TextureSize] = true;
+										}
+										//Store the positions we are currently seeing.
+										currentlyInSight.Add(FVector2D(x, y));
+
+									}
+								}
+							}
+						}
+					}
+				}
+				//Is the current actor marked for checking if is in terra incognita
+
+				if (*Itr != nullptr) {
+					bCheckActorInTerraIncog = (*Itr)->FindComponentByClass<URegisterToFOW>()->bCheckActorTerraIncog;
+				}
+				if (bCheckActorInTerraIncog) {
+					//if the current position textureSpacePosXY in the UnfoggedData bool array is false the actor is in the Terra Incognita
+					if (Manager->UnfoggedData[textureSpacePos.X + textureSpacePos.Y * Manager->TextureSize] == false) {
+						(*Itr)->FindComponentByClass<URegisterToFOW>()->isActorInTerraIncog = true;
+
+					}
+					else {
+						(*Itr)->FindComponentByClass<URegisterToFOW>()->isActorInTerraIncog = false;
+					}
+				}
+			}
+
+			URegisterAreaToFOW* AreaFOW = (*Itr)->FindComponentByClass<URegisterAreaToFOW>();
+			if (AreaFOW != nullptr && AreaFOW->BoxArea != nullptr)
+			{
+				isWriteUnFog = AreaFOW->WriteUnFog;
+				FVector BoxExtent = AreaFOW->BoxArea->GetScaledBoxExtent();
+
+				//Store the positions we want to blur
+				for (int y = posY - BoxExtent.Y / 2 - halfKernelSize; y <= posY + BoxExtent.Y / 2 + halfKernelSize; y++) {
+					for (int x = posX - BoxExtent.X / 2 - halfKernelSize; x <= posX + BoxExtent.X / 2 + halfKernelSize; x++) {
+						if (x > 0 && x < size && y > 0 && y < size) {
+							texelsToBlur.Add(FIntPoint(x, y));
+						}
+					}
+				}
+
+				if (isWriteUnFog) {
+					//Unveil the positions our actors are currently looking at
+					for (int y = posY - BoxExtent.Y / dividend; y <= posY + BoxExtent.Y / dividend; y++) {
+						for (int x = posX - BoxExtent.X / dividend; x <= posX + BoxExtent.X / dividend; x++) {
+							//Kernel for radial sight
+							if (x > 0 && x < size && y > 0 && y < size) {
 
 								if (isWriteTerraIncog) {
 									//if the actor is able then
@@ -139,27 +195,12 @@ void AFogOfWarWorker::UpdateFowTexture() {
 								}
 								//Store the positions we are currently seeing.
 								currentlyInSight.Add(FVector2D(x, y));
-
 							}
 						}
 					}
+					isWriteUnFog = false;
+					AreaFOW->WriteUnFog = false;
 				}
-			}
-		}
-
-		//Is the current actor marked for checking if is in terra incognita
-
-		if (*Itr != nullptr) {
-			bCheckActorInTerraIncog = (*Itr)->FindComponentByClass<URegisterToFOW>()->bCheckActorTerraIncog;
-		}
-		if (bCheckActorInTerraIncog) {
-			//if the current position textureSpacePosXY in the UnfoggedData bool array is false the actor is in the Terra Incognita
-			if (Manager->UnfoggedData[textureSpacePos.X + textureSpacePos.Y * Manager->TextureSize] == false) {
-				(*Itr)->FindComponentByClass<URegisterToFOW>()->isActorInTerraIncog = true;
-
-			}
-			else {
-				(*Itr)->FindComponentByClass<URegisterToFOW>()->isActorInTerraIncog = false;
 			}
 		}
 
